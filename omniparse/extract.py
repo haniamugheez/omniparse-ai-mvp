@@ -71,7 +71,10 @@ CURRENCIES = {"PKR": ("pkr", "rs.", "rs ", "rupee"), "USD": ("usd", "$"),
               "EUR": ("eur", "€"), "GBP": ("gbp", "£"), "AED": ("aed", "dirham")}
 
 DATE_FORMATS = ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y", "%d-%b-%Y",
-                "%d %b %Y", "%d %B %Y", "%d-%B-%Y", "%d/%m/%y", "%d-%m-%y")
+                "%d %b %Y", "%d %B %Y", "%d-%B-%Y", "%d/%m/%y", "%d-%m-%y",
+                # "October 05, 2026" — how an American system writes it
+                "%B %d, %Y", "%b %d, %Y", "%B %d %Y", "%b %d %Y",
+                "%Y/%m/%d", "%d.%m.%Y")
 
 
 # ---------------------------------------------------------------------------
@@ -229,78 +232,378 @@ def _confidence(invoice: Invoice) -> float:
 # ---------------------------------------------------------------------------
 # Tables — no OCR, no model, no guessing
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Tables — the part that has to survive a real invoice
+#
+# The file that forced this rewrite is a courier reconciliation run. Column A
+# is empty down the whole sheet. The vendor sits on row 8, the invoice number
+# on row 10 inside one cell as "Customer Invoice Number: INV-… # 010-…", the
+# billing date on row 12 with its label in one cell and its value in the next,
+# and the column headings do not appear until row 14. Below that, each
+# shipment is three rows — a freight charge, a fuel surcharge, and a "Total"
+# line — with the shipment's own details written only on the first of them,
+# and amounts formatted as "$ -1.29".
+#
+# Read that with pandas' default header=0 and every column is named after a
+# blank cell. That is why it came out as a record with no invoice number, no
+# vendor, no date, no total and no lines: not a hard document, just one the
+# reader was too polite to look at properly.
+#
+# So nothing is assumed. The header row is found, the preamble above it is
+# mined for the facts an invoice carries outside its table, group columns are
+# carried down, money is parsed in the shapes money actually comes in, and
+# subtotal rows are recognised as subtotals rather than counted twice.
+# ---------------------------------------------------------------------------
 COLUMN_ALIASES = {
-    "invoice_id": ("invoice_id", "invoice no", "invoice number", "invoice#",
-                   "invoice", "bill no", "bill_no", "doc no", "id"),
+    "invoice_id": ("invoice_id", "invoice no", "invoice no.", "invoice number",
+                   "invoice#", "invoice #", "invoice", "bill no", "bill_no",
+                   "doc no", "document no", "reference", "ref no"),
     "vendor": ("vendor", "supplier", "vendor name", "supplier name", "party",
-               "billed by", "company"),
+               "billed by", "company", "merchant", "payee"),
     "invoice_date": ("invoice_date", "date", "invoice date", "bill date",
-                     "issue date", "dated"),
+                     "billing date", "issue date", "dated", "shipment date",
+                     "transaction date", "posting date"),
     "description": ("description", "item", "particulars", "details",
-                    "line item", "product", "service"),
-    "quantity": ("quantity", "qty", "units", "no of units", "count"),
+                    "line item", "product", "service", "charge description",
+                    "charge type", "narration", "expense", "charge"),
+    "quantity": ("quantity", "qty", "units", "no of units", "count", "pieces"),
     "unit_price": ("unit_price", "unit price", "rate", "price", "unit cost",
-                   "rate per unit"),
+                   "rate per unit", "unit rate"),
     "amount": ("amount", "line total", "total amount", "value", "line amount",
-               "net amount"),
+               "net amount", "charge amount", "amount (usd)", "amount usd",
+               "debit", "credit"),
     "tax": ("tax", "vat", "gst", "sales tax", "tax amount"),
     "total": ("total", "grand total", "invoice total", "amount due",
-              "total payable"),
-    "currency": ("currency", "ccy"),
+              "total payable", "net payable"),
+    "currency": ("currency", "ccy", "curr"),
 }
 
+# A header is matched on its words, not on an exact string. "Item Description",
+# "Charge Description" and "Service Description" are all the description
+# column, and no list of exact phrases will ever contain the next one a vendor
+# invents. So: strip the decoration, then look for a known phrase inside.
+def _norm(value) -> str:
+    # An empty spreadsheet cell arrives as a float NaN, and str() turns that
+    # into the word "nan" — three letters, no colon, not an address, which is
+    # exactly the shape this code was looking for in a vendor name. One
+    # invoice came back billed by "nan". Empty is empty, here and everywhere
+    # that calls this.
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    text = str(value).strip().lower()
+    if text in ("nan", "none", "nat", "#n/a", "n/a", "-", "--"):
+        return ""
+    text = re.sub(r"[\u2013\u2014]", "-", text)
+    text = re.sub(r"\s*\([^)]*\)", " ", text)      # "Amount (USD)" -> "Amount"
+    text = re.sub(r"[^a-z0-9#/ .-]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
-def _column_map(frame: pd.DataFrame) -> dict:
-    found = {}
-    lowered = {str(c).strip().lower(): c for c in frame.columns}
+
+def _alias_of(cell) -> tuple:
+    """(field, how good a match) for a header cell, or (None, 0).
+
+    The score matters because a sheet can offer two candidates for the same
+    field — an accountant's export has "Debit", "Credit" AND "Amount", and the
+    first two are usually empty. An exact match beats a word found inside a
+    longer heading, so "Amount" wins over "Debit" and the real numbers are
+    read.
+    """
+    text = _norm(cell)
+    if not text or text.replace(".", "").isdigit():
+        return None, 0
+    best = (None, 0)
     for field, aliases in COLUMN_ALIASES.items():
         for alias in aliases:
-            if alias in lowered:
-                found[field] = lowered[alias]
-                break
+            if text == alias:
+                return field, 3                      # exact
+            if re.search(rf"\b{re.escape(alias)}\b", text) and 2 > best[1]:
+                best = (field, 2)                    # contained
+    return best
+
+
+MAX_HEADER_SCAN = 40        # how far down to look for the column headings
+
+
+def _find_header(frame: pd.DataFrame) -> int | None:
+    """The row that names the columns, wherever the sheet put it.
+
+    Scored, not guessed: a header row is the one where the most cells are
+    recognisable field names. Two matches and three filled cells is the floor,
+    so a stray line of prose cannot be mistaken for a header.
+    """
+    best_row, best_score = None, 0
+    for i in range(min(len(frame), MAX_HEADER_SCAN)):
+        row = frame.iloc[i]
+        filled = sum(1 for c in row if _norm(c))
+        hits = sum(1 for c in row if _alias_of(c)[0])
+        if hits >= 2 and filled >= 3 and hits > best_score:
+            best_row, best_score = i, hits
+    return best_row
+
+
+# The first number in the cell, with its own minus sign if it has one. Written
+# this way rather than by stripping characters, because "Rs 2,500/-" ends in a
+# dash that is punctuation, not arithmetic — strip-and-parse turns it into
+# "2500.-" and then into nothing at all.
+MONEY_PATTERN = re.compile(r"-?\d[\d,\u00a0 ]*(?:\.\d+)?")
+
+
+def _amount(value) -> float:
+    """Money as it is actually written: "$ -1.29", "(1,234.56)", "Rs 2,500/-"."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return 0.0
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return round(float(value), 2)
+
+    text = str(value).strip()
+    if not text:
+        return 0.0
+    found = MONEY_PATTERN.search(text)
+    if not found:
+        return 0.0
+    try:
+        number = float(found.group().replace(",", "")
+                       .replace("\u00a0", "").replace(" ", ""))
+    except ValueError:
+        return 0.0
+    # Accountants wrap a negative in brackets instead of signing it.
+    if text.startswith("(") and text.endswith(")"):
+        number = -abs(number)
+    return round(number, 2)
+
+
+SUBTOTAL_WORDS = ("total", "subtotal", "sub-total", "sub total", "balance")
+GRAND_TOTAL_WORDS = ("grand total", "invoice total", "amount due",
+                     "total due", "net payable", "balance due")
+
+
+def _bare(text: str) -> str:
+    """Normalised, with the decoration a spreadsheet puts around a label.
+
+    "GRAND TOTAL:" is the same word as "Grand Total". A trailing colon is why
+    the grand total was once counted as an ordinary charge, which doubled the
+    invoice and then produced an arithmetic failure the document never had.
+    """
+    return _norm(text).strip(" :.-*\u2013\u2014")
+
+
+def _is_grand_total(text: str) -> bool:
+    return _bare(text) in GRAND_TOTAL_WORDS
+
+
+def _is_subtotal(text: str) -> bool:
+    """A "Total" line inside the table is one group's own sum, not a charge."""
+    return _bare(text) in SUBTOTAL_WORDS
+
+
+LABELS = {
+    "invoice_id": ("invoice number", "invoice no", "invoice #", "invoice:",
+                   "customer invoice number", "bill number", "bill no",
+                   "bill #", "document number", "document no", "doc no",
+                   "reference number", "reference no", "ref no", "ref #"),
+    "invoice_date": ("billing date", "invoice date", "bill date", "date of issue",
+                     "issue date", "dated", "date:"),
+    "vendor": ("vendor", "supplier", "billed by", "sold by", "from:",
+               "remit to", "merchant"),
+    "total": ("grand total", "invoice total", "total due", "amount due",
+              "total amount due", "net payable", "balance due"),
+}
+
+COMPANY_WORDS = ("ltd", "limited", "llc", "inc", "pvt", "co.", "company",
+                 "corp", "express", "services", "service", "logistics",
+                 "traders", "enterprises", "supplies", "solutions", "group",
+                 "international", "industries", "store", "mart")
+
+# A document's own title is not the company that sent it.
+TITLE_WORDS = ("invoice", "statement", "report", "summary", "adjustment",
+               "reconciliation", "tax invoice", "credit note", "debit note",
+               "bill of", "remittance", "account")
+
+ADDRESS_HINT = re.compile(
+    r"\b(road|street|st\.|drive|avenue|ave|block|sector|plot|house|suite|"
+    r"floor|p\.?o\.?\s*box|zip|postal)\b|\d{4,}", re.I)
+
+
+def _preamble_facts(frame: pd.DataFrame, header_row: int) -> dict:
+    """Everything an invoice says ABOVE its table.
+
+    Two shapes, both common and both here: the label and the value in one cell
+    ("Customer Invoice Number: INV-…"), and the label in one cell with the
+    value in the next ("Billing Date:" | "October 05, 2026").
+    """
+    found: dict = {}
+    rows = frame.iloc[:header_row] if header_row else frame.iloc[:0]
+
+    for _, row in rows.iterrows():
+        cells = [str(c).strip() for c in row if _norm(c)]
+        for index, cell in enumerate(cells):
+            lowered = cell.lower()
+            for field, labels in LABELS.items():
+                if field in found:
+                    continue
+                for label in labels:
+                    if label not in lowered:
+                        continue
+                    after = cell[lowered.index(label) + len(label):]
+                    after = after.lstrip(" :-\u2013\u2014\t")
+                    if not after and index + 1 < len(cells):
+                        after = cells[index + 1]
+                    if after.strip():
+                        found[field] = after.strip()
+                    break
+
+    # The vendor rarely carries a label. Take the most company-looking line
+    # above the table that is not an address and not a label.
+    if "vendor" not in found:
+        best = None
+        for _, row in rows.iterrows():
+            for cell in row:
+                text = str(cell).strip() if _norm(cell) else ""
+                if not (3 <= len(text) <= 60) or ":" in text:
+                    continue
+                if ADDRESS_HINT.search(text):
+                    continue
+                if any(w in text.lower() for w in TITLE_WORDS):
+                    continue
+                score = (sum(w in text.lower() for w in COMPANY_WORDS) * 10
+                         + len(text.split()))
+                if best is None or score > best[0]:
+                    best = (score, text)
+        if best and best[0] > 0:
+            found["vendor"] = best[1]
     return found
 
 
 def from_frame(frame: pd.DataFrame, filename: str, method: str) -> list:
-    """A spreadsheet may hold many invoices. Group by invoice id, or treat the
-    whole sheet as one document when there is no id column."""
-    cols = _column_map(frame)
-    if "invoice_id" in cols:
-        groups = frame.groupby(frame[cols["invoice_id"]].astype(str), sort=False)
-    else:
-        groups = [("", frame)]
+    """One raw sheet in, one or more invoices out."""
+    frame = frame.dropna(axis=1, how="all").dropna(axis=0, how="all")
+    frame = frame.reset_index(drop=True)
+    if frame.empty:
+        return [Invoice(source_file=filename, source_kind="table",
+                        extraction_method=f"table ({method})")]
+
+    header_row = _find_header(frame)
+    if header_row is None:
+        # No recognisable table. Still report what the preamble says rather
+        # than returning an empty shell.
+        invoice = Invoice(source_file=filename, source_kind="table",
+                          extraction_method=f"table ({method}, no header found)")
+        _apply_preamble(invoice, _preamble_facts(frame, len(frame)))
+        invoice.confidence = _confidence(invoice)
+        return [invoice]
+
+    facts = _preamble_facts(frame, header_row)
+    headers = [_alias_of(c) for c in frame.iloc[header_row]]
+    body = frame.iloc[header_row + 1:].reset_index(drop=True)
+
+    # Two columns can claim the same field. Keep the better-scoring one, and
+    # break a tie with whichever column actually holds values — an empty
+    # "Debit" column must not win over a full "Amount" one.
+    cols: dict = {}
+    scores: dict = {}
+    for position, (field, score) in enumerate(headers):
+        if not field:
+            continue
+        filled = sum(1 for v in frame.iloc[header_row + 1:, position]
+                     if _norm(v) not in ("", "nan"))
+        rank = (score, filled)
+        if field not in cols or rank > scores[field]:
+            cols[field], scores[field] = position, rank
+
+    # Group columns are written once per group and left blank on the rows
+    # beneath. Carry them down so every line knows which shipment it belongs to.
+    for field in ("invoice_id", "vendor", "invoice_date", "currency"):
+        if field in cols:
+            body.iloc[:, cols[field]] = body.iloc[:, cols[field]].ffill()
+
+    groups = ([(str(key), rows) for key, rows in
+               body.groupby(body.iloc[:, cols["invoice_id"]].astype(str),
+                            sort=False)]
+              if "invoice_id" in cols else [("", body)])
 
     invoices = []
     for invoice_id, rows in groups:
         invoice = Invoice(source_file=filename, source_kind="table",
                           extraction_method=f"table ({method})")
-        invoice.invoice_id = str(invoice_id).strip()
-        if "vendor" in cols:
-            invoice.vendor = str(rows[cols["vendor"]].iloc[0]).strip()
-        if "invoice_date" in cols:
-            invoice.invoice_date = _parse_date(
-                str(rows[cols["invoice_date"]].iloc[0]).split(" ")[0])
+        invoice.invoice_id = invoice_id.strip()
+        _apply_preamble(invoice, facts)
+
+        if "vendor" in cols and not invoice.vendor:
+            invoice.vendor = _first_text(rows, cols["vendor"])
         if "currency" in cols:
-            invoice.currency = str(rows[cols["currency"]].iloc[0]).strip().upper()
+            invoice.currency = (_first_text(rows, cols["currency"]).upper()
+                                or invoice.currency)
+        if invoice.invoice_date is None and "invoice_date" in cols:
+            invoice.invoice_date = _parse_date(_first_text(rows,
+                                                           cols["invoice_date"]))
 
-        if "description" in cols:
-            for _, row in rows.iterrows():
-                invoice.line_items.append(LineItem(
-                    description=str(row[cols["description"]]).strip(),
-                    quantity=_money(row.get(cols.get("quantity"), 0)),
-                    unit_price=_money(row.get(cols.get("unit_price"), 0)),
-                    amount=_money(row.get(cols.get("amount"), 0)),
-                ))
+        stated_total = 0.0
+        grand_total = 0.0
+        for _, row in rows.iterrows():
+            description = (str(row.iloc[cols["description"]]).strip()
+                           if "description" in cols else "")
+            if _norm(description) in ("", "nan"):
+                continue
+            amount = _amount(row.iloc[cols["amount"]]) if "amount" in cols else 0.0
+            if _is_grand_total(description):
+                grand_total = amount      # the document's own answer; it wins
+                continue
+            if _is_subtotal(description):
+                stated_total += amount
+                continue
+            invoice.line_items.append(LineItem(
+                description=description,
+                quantity=_amount(row.iloc[cols["quantity"]])
+                if "quantity" in cols else 0.0,
+                unit_price=_amount(row.iloc[cols["unit_price"]])
+                if "unit_price" in cols else 0.0,
+                amount=amount,
+            ))
 
-        invoice.tax = _money(rows[cols["tax"]].iloc[0]) if "tax" in cols else 0.0
+        if "tax" in cols:
+            # The tax for the whole invoice is written against every line of
+            # it. Adding those up charges the customer tax once per item.
+            taxes = [_amount(row.iloc[cols["tax"]]) for _, row in rows.iterrows()]
+            distinct = {t for t in taxes if t}
+            invoice.tax = (sum(taxes) if len(distinct) == len(
+                [t for t in taxes if t]) and len(distinct) > 1
+                else (max(distinct, key=abs) if distinct else 0.0))
         if "total" in cols:
-            invoice.total = _money(rows[cols["total"]].iloc[0])
-        elif invoice.line_items:
+            invoice.total = max(
+                (_amount(row.iloc[cols["total"]]) for _, row in rows.iterrows()),
+                key=abs, default=0.0)
+        if grand_total:
+            invoice.total = grand_total
+        if not invoice.total and stated_total:
+            invoice.total = round(stated_total, 2)
+        if not invoice.total and invoice.line_items:
             invoice.total = round(invoice.line_total + invoice.tax, 2)
+
         invoice.subtotal = invoice.line_total
         invoice.confidence = _confidence(invoice)
         invoices.append(invoice)
     return invoices
+
+
+def _first_text(rows: pd.DataFrame, position: int) -> str:
+    for value in rows.iloc[:, position]:
+        text = str(value).strip() if _norm(value) else ""
+        if text and text.lower() != "nan":
+            return text
+    return ""
+
+
+def _apply_preamble(invoice: Invoice, facts: dict) -> None:
+    if facts.get("invoice_id") and not invoice.invoice_id:
+        invoice.invoice_id = facts["invoice_id"][:80]
+    if facts.get("vendor") and not invoice.vendor:
+        invoice.vendor = facts["vendor"][:60]
+    if facts.get("invoice_date") and invoice.invoice_date is None:
+        invoice.invoice_date = _parse_date(facts["invoice_date"])
+    if facts.get("total") and not invoice.total:
+        invoice.total = _amount(facts["total"])
 
 
 # ---------------------------------------------------------------------------

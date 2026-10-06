@@ -17,6 +17,7 @@ Three roads:
 
 from __future__ import annotations
 
+import csv
 import io
 import logging
 
@@ -83,12 +84,34 @@ def read_image(data: bytes) -> tuple:
 
 
 def read_table(data: bytes, filename: str) -> tuple:
-    """Return (DataFrame, method)."""
+    """Return (DataFrame, method) — raw, with NO header assumed.
+
+    A real invoice does not start its table on row one. One in front of me
+    while writing this has the vendor on row 8, the invoice number on row 10
+    and the column headings on row 14, with an empty first column throughout.
+    Read with `header=0` and pandas names every column after a blank cell.
+
+    CSV gets its own reader rather than pandas' because an exported invoice is
+    usually ragged: a line of prose across one cell, a blank line, then a
+    seven-column table. pandas decides the file has one column from the first
+    line and then refuses the rest of the file outright. `csv.reader` has no
+    such opinion — it hands back the rows as they are, and they get padded to
+    the widest one here.
+    """
     lowered = filename.lower()
     if lowered.endswith((".xlsx", ".xls")):
-        return pd.read_excel(io.BytesIO(data)), "pandas-excel"
-    sep = "\t" if lowered.endswith(".tsv") else ","
-    return pd.read_csv(io.BytesIO(data), sep=sep), "pandas-csv"
+        return pd.read_excel(io.BytesIO(data), header=None, dtype=object), \
+            "pandas-excel"
+
+    text = data.decode("utf-8-sig", errors="replace")
+    delimiter = "\t" if lowered.endswith(".tsv") else ","
+    rows = list(csv.reader(io.StringIO(text), delimiter=delimiter))
+    if not rows:
+        return pd.DataFrame(), "csv"
+    width = max(len(r) for r in rows)
+    padded = [r + [None] * (width - len(r)) for r in rows]
+    frame = pd.DataFrame(padded, dtype=object)
+    return frame.replace("", None), "csv"
 
 
 # ---------------------------------------------------------------------------

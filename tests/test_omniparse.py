@@ -209,3 +209,196 @@ def test_every_agent_reports_in_the_trace(baseline):
     agents = [step.agent for step in run.trace]
     assert agents == ["Document Ingestion & Routing", "Structured Extraction",
                       "Validation & Audit", "Anomaly Discovery Engine"]
+
+
+# ===========================================================================
+# A real invoice, in the shape real invoices come in
+#
+# A courier reconciliation run, exported to Excel. Column A is empty down the
+# whole sheet. The vendor is on row 8, the invoice number on row 10 inside one
+# cell as "Customer Invoice Number: INV-… # 010-…", the billing date on row 12
+# with its label in one cell and its value in the next, and the column
+# headings do not start until row 14. Each shipment is three rows — a freight
+# charge, a fuel surcharge and a "Total" — with the shipment's details written
+# only on the first, and amounts written as "$ -1.29".
+#
+# Read with the obvious assumptions, this file came out as a record with no
+# invoice number, no vendor, no date, no total and no lines: 0% confidence.
+# That is what these tests are here to stop happening again.
+# ===========================================================================
+FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"
+COURIER = FIXTURES / "courier_reconciliation.xlsx"
+
+
+@pytest.fixture(scope="module")
+def courier(baseline):
+    return process(COURIER.read_bytes(), "courier_reconciliation.xlsx", baseline)
+
+
+def test_a_header_buried_on_row_fourteen_is_still_found(courier):
+    assert courier.ok, courier.error
+    assert len(courier.results) == 1
+
+
+def test_the_invoice_number_is_dug_out_of_a_sentence(courier):
+    """It is not in a column. It is inside one cell, after a label."""
+    assert "INV-ADJ" in courier.results[0].invoice.invoice_id
+
+
+def test_the_vendor_is_found_without_a_label(courier):
+    """Nothing says "Vendor:". The name just sits there on row 8 — and the
+    bill-to company, its street and its city sit above it as decoys."""
+    vendor = courier.results[0].invoice.vendor
+    assert vendor == "Global Express PK"
+    assert "KINGSTON" not in vendor and "OAK BROOK" not in vendor
+
+
+def test_a_label_in_one_cell_and_its_date_in_the_next(courier):
+    assert courier.results[0].invoice.invoice_date == date(2026, 10, 5)
+
+
+def test_every_charge_line_is_read_and_subtotals_are_not_counted_twice(courier):
+    """Four charges, two group "Total" rows, one "GRAND TOTAL:". Only the four
+    charges are line items — counting the sums as charges doubles the
+    invoice."""
+    invoice = courier.results[0].invoice
+    assert len(invoice.line_items) == 4
+    assert {li.description for li in invoice.line_items} == {
+        "Freight Charges", "Fuel Surcharge"}
+
+
+def test_the_grand_total_wins_over_the_group_sums(courier):
+    """"GRAND TOTAL:" with a colon used to slip past as an ordinary charge."""
+    assert courier.results[0].invoice.total == 0.86
+
+
+def test_the_arithmetic_agrees_so_nothing_is_falsely_flagged(courier):
+    """-1.29 - 0.35 + 2.00 + 0.50 = 0.86. The document is sound, and the audit
+    must say so rather than inventing a failure."""
+    invoice = courier.results[0].invoice
+    assert invoice.line_total == 0.86
+    codes = {a.code for a in courier.results[0].anomalies}
+    assert "TOTAL_MATH" not in codes
+    assert "AUDIT_TRAIL_GAP" not in codes
+    assert "LOW_CONFIDENCE" not in codes
+
+
+def test_a_document_this_complete_reads_at_full_confidence(courier):
+    assert courier.results[0].invoice.confidence >= 0.95
+
+
+@pytest.mark.parametrize("written,expected", [
+    ("$ -1.29", -1.29), ("$ 1,234.56", 1234.56), ("(500.00)", -500.0),
+    ("Rs 2,500/-", 2500.0), ("  ", 0.0), ("—", 0.0), (None, 0.0), (42, 42.0),
+])
+def test_money_is_read_in_the_shapes_money_is_written(written, expected):
+    from omniparse.extract import _amount
+    assert _amount(written) == expected
+
+
+@pytest.mark.parametrize("label,is_grand,is_sub", [
+    ("GRAND TOTAL:", True, False), ("Grand Total", True, False),
+    ("Total", False, True), ("total ", False, True),
+    ("Sub-Total", False, True), ("Freight Charges", False, False),
+])
+def test_a_trailing_colon_does_not_hide_a_total(label, is_grand, is_sub):
+    from omniparse.extract import _is_grand_total, _is_subtotal
+    assert _is_grand_total(label) is is_grand
+    assert _is_subtotal(label) is is_sub
+
+
+# ===========================================================================
+# Any invoice, not this invoice
+#
+# The point of the extractor is that it reads whatever arrives, so a fixture
+# built from one real file proves very little on its own. These six are
+# deliberately unalike — different header rows, different column wording,
+# different currencies and conventions, one invoice or several per sheet,
+# brackets for negatives, a line of prose above the table. None of them looks
+# like the courier file that prompted the rewrite.
+#
+# Each one is checked for the four things a record is useless without: who
+# billed, which document, when, and what it adds up to.
+# ===========================================================================
+SHAPES = [
+    # file, invoice_id, vendor, date, lines, total
+    ("A_plain.xlsx",  "SI-900",     "Nova Supplies Ltd",        date(2026, 3, 11), 2, 5500.00),
+    ("B_desi.xlsx",   "BT-2026-77", "KARACHI TRADERS",          date(2026, 3, 11), 2, 31000.00),
+    ("C_us.xlsx",     "BR-88421",   "Blue Ridge Logistics LLC", date(2026, 3, 11), 2, 720.00),
+    ("F_decoy.csv",   "SV-77",      "Crescent IT Services",     date(2026, 5, 20), 2, 37000.00),
+]
+
+
+@pytest.mark.parametrize("name,invoice_id,vendor,when,lines,total", SHAPES)
+def test_an_invoice_of_any_shape_is_read(baseline, name, invoice_id, vendor,
+                                         when, lines, total):
+    run = process((FIXTURES / name).read_bytes(), name, baseline)
+    assert run.ok, run.error
+    invoice = run.results[0].invoice
+    assert invoice.invoice_id == invoice_id
+    assert invoice.vendor == vendor
+    assert invoice.invoice_date == when
+    assert len(invoice.line_items) == lines
+    assert invoice.total == total
+    assert invoice.confidence >= 0.9
+
+
+def test_several_invoices_in_one_sheet_come_out_separately(baseline):
+    """Grouped by an invoice-number column, with the vendor and date written
+    once at the top of each group and left blank beneath."""
+    run = process((FIXTURES / "D_multi.xlsx").read_bytes(), "D_multi.xlsx",
+                  baseline)
+    assert len(run.results) == 2
+    first, second = (r.invoice for r in run.results)
+    assert (first.invoice_id, first.vendor) == ("MX-1", "Alpha Foods")
+    assert (second.invoice_id, second.vendor) == ("MX-2", "Beta Paper")
+    assert len(first.line_items) == 2        # the second line inherits both
+
+
+def test_a_tax_written_against_every_line_is_charged_once(baseline):
+    """1,020 appears on both lines of MX-1. It is the invoice's tax, not each
+    line's — summing it charges the customer twice."""
+    run = process((FIXTURES / "D_multi.xlsx").read_bytes(), "D_multi.xlsx",
+                  baseline)
+    assert run.results[0].invoice.tax == 1020.00
+
+
+def test_brackets_mean_a_credit_not_a_charge(baseline):
+    """An accountant writes a negative as (1,250.00)."""
+    run = process((FIXTURES / "E_credit.xlsx").read_bytes(), "E_credit.xlsx",
+                  baseline)
+    invoice = run.results[0].invoice
+    assert invoice.invoice_id == "ADJ-5512"
+    assert invoice.line_items[0].amount == -1250.00
+    assert invoice.total == -950.00
+
+
+def test_a_missing_vendor_is_reported_honestly_not_invented(baseline):
+    """E_credit names no supplier anywhere. The right answer is to say so and
+    drop the confidence — not to put the document's own title in the field."""
+    run = process((FIXTURES / "E_credit.xlsx").read_bytes(), "E_credit.xlsx",
+                  baseline)
+    invoice = run.results[0].invoice
+    assert invoice.vendor == ""
+    assert invoice.confidence < 0.9
+    assert "AUDIT_TRAIL_GAP" in {a.code for a in run.results[0].anomalies}
+
+
+def test_a_blank_cell_never_becomes_the_word_nan(baseline):
+    """str() on an empty spreadsheet cell gives "nan" — three letters, not an
+    address, not a label, which is exactly the shape a vendor name has. One
+    invoice came back billed by "nan"."""
+    for name, *_ in SHAPES:
+        run = process((FIXTURES / name).read_bytes(), name, baseline)
+        for result in run.results:
+            assert "nan" not in result.invoice.vendor.lower()
+            assert "nan" not in result.invoice.invoice_id.lower()
+
+
+def test_a_ragged_csv_does_not_defeat_the_reader(baseline):
+    """One cell of prose, a blank line, then a seven-column table. pandas
+    decides the file has one column and refuses the rest."""
+    run = process((FIXTURES / "F_decoy.csv").read_bytes(), "F_decoy.csv",
+                  baseline)
+    assert run.ok, run.error
+    assert len(run.results[0].invoice.line_items) == 2
