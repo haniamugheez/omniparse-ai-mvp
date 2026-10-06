@@ -678,3 +678,155 @@ def _apply(invoice: Invoice, filled: dict) -> None:
                 unit_price=_money(row.get("unit_price", 0)),
                 amount=_money(row.get("amount", 0)),
             ))
+
+# ---------------------------------------------------------------------------
+# When nothing else could read the page
+#
+# Two documents arrive that rules cannot touch: a photographed invoice on a
+# machine with no OCR engine, and a spreadsheet laid out so unusually that no
+# row in it looks like a header. Both used to come back empty.
+#
+# A vision model reads either. It is slower and it costs, so it is the last
+# resort and never the first — the rules run first, every time, and this is
+# only reached when they have genuinely come up short. With no API key
+# configured it does not run at all, and the record says honestly that it
+# could not be read.
+# ---------------------------------------------------------------------------
+# Model names expire. This code first shipped pointing at
+# `llama-4-scout-17b-16e-instruct`, which Groq retired, and every scan then
+# came back "vision failed (404)" — a dead string in a config file taking down
+# a working feature.
+#
+# So the model is not hard-coded. The account's own model list is read and the
+# first one we know can see is used, newest preference first. Set
+# OMNIPARSE_VISION_MODEL to override; if the list cannot be fetched, the first
+# candidate is tried anyway, because a 404 is a better outcome than refusing
+# to try.
+VISION_CANDIDATES = (
+    "qwen/qwen3.8-27b",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+)
+
+_vision_model_cache: list = []
+
+
+def vision_model() -> str:
+    override = os.getenv("OMNIPARSE_VISION_MODEL")
+    if override:
+        return override
+    if _vision_model_cache:
+        return _vision_model_cache[0]
+
+    available = _models_on_this_account()
+    for candidate in VISION_CANDIDATES:
+        if not available or candidate in available:
+            _vision_model_cache.append(candidate)
+            logger.info("vision.model_selected %s", candidate)
+            return candidate
+    _vision_model_cache.append(VISION_CANDIDATES[0])
+    return VISION_CANDIDATES[0]
+
+
+def _models_on_this_account() -> set:
+    """What this key can actually reach. An empty set means "could not ask"."""
+    import httpx
+
+    if not _api_key():
+        return set()
+    try:
+        with httpx.Client(timeout=15) as client:
+            response = client.get(
+                "https://api.groq.com/openai/v1/models",
+                headers={"Authorization": f"Bearer {_api_key()}"})
+        if response.status_code >= 400:
+            return set()
+        return {m.get("id") for m in response.json().get("data", [])}
+    except Exception:   # noqa: BLE001 — never let a lookup cost a document
+        logger.exception("vision.model_list_failed")
+        return set()
+
+INVOICE_SCHEMA_PROMPT = (
+    "Read this invoice and return ONLY a JSON object with these keys: "
+    "invoice_id, vendor, invoice_date, currency, tax, total, line_items. "
+    "line_items is a list of objects with description, quantity, unit_price, "
+    "amount. Dates as YYYY-MM-DD. Numbers plain — no commas, no currency "
+    "symbols; a credit or refund is negative. Use null for anything the "
+    "document does not say. NEVER invent a value that is not visible in the "
+    "document."
+)
+
+
+def vision_available() -> bool:
+    return bool(_api_key())
+
+
+def from_image(image: bytes, filename: str, kind: str = "image") -> Invoice:
+    """Read a page by looking at it."""
+    import base64
+
+    import httpx
+
+    invoice = Invoice(source_file=filename, source_kind=kind,
+                      extraction_method="vision")
+    if not image or not _api_key():
+        invoice.extraction_method = "unreadable (no OCR engine, no vision key)"
+        return invoice
+
+    encoded = base64.b64encode(image).decode()
+    model = vision_model()
+    try:
+        with httpx.Client(timeout=90) as client:
+            response = client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {_api_key()}"},
+                json={
+                    "model": model,
+                    "temperature": 0,
+                    "response_format": {"type": "json_object"},
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": INVOICE_SCHEMA_PROMPT},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:image/png;base64,{encoded}"}},
+                    ]}],
+                })
+        if response.status_code == 404 and "model" in response.text.lower():
+            # Retired between runs. Forget it and let the next call re-choose.
+            logger.warning("vision.model_retired %s", model)
+            _vision_model_cache.clear()
+            if model in VISION_CANDIDATES:
+                VISION_CANDIDATES_LEFT = [c for c in VISION_CANDIDATES
+                                          if c != model]
+                if VISION_CANDIDATES_LEFT:
+                    os.environ.pop("OMNIPARSE_VISION_MODEL", None)
+                    _vision_model_cache.append(VISION_CANDIDATES_LEFT[0])
+                    return from_image(image, filename, kind)
+            invoice.extraction_method = "vision failed (no usable model)"
+            return invoice
+        if response.status_code >= 400:
+            logger.warning("vision.error %s %s", response.status_code,
+                           response.text[:200])
+            invoice.extraction_method = f"vision failed ({response.status_code})"
+            return invoice
+        filled = json.loads(response.json()["choices"][0]["message"]["content"])
+    except Exception:   # noqa: BLE001 — a model outage is not a crash
+        logger.exception("vision.failed")
+        invoice.extraction_method = "vision failed"
+        return invoice
+
+    if filled.get("currency"):
+        invoice.currency = str(filled["currency"]).strip().upper()[:4]
+    _apply(invoice, filled)
+    invoice.confidence = round(_confidence(invoice) * 0.9, 2)   # read, not parsed
+    return invoice
+
+
+def sheet_as_text(frame: pd.DataFrame, limit: int = 120) -> str:
+    """A spreadsheet written out as lines, for a model to read."""
+    lines = []
+    for _, row in frame.head(limit).iterrows():
+        cells = [str(c).strip() for c in row if _norm(c)]
+        if cells:
+            lines.append(" | ".join(cells))
+    return "\n".join(lines)
+

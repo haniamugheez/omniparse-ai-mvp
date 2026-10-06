@@ -22,9 +22,32 @@ from omniparse.store import Baseline           # noqa: E402
 SAMPLES = pathlib.Path(__file__).resolve().parent.parent / "sample_data"
 
 
-@pytest.fixture(scope="module")
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    """No test may call out to the internet.
+
+    Two of these tests quietly started making real API calls the moment a
+    GROQ_API_KEY appeared in .streamlit/secrets.toml — they passed on a
+    machine with no key and failed on one with it, which is the worst kind of
+    test there is. A suite has to say the same thing on every machine, so the
+    key is taken away here and the tests that need a model stub it instead.
+    """
+    monkeypatch.setattr(extract, "_api_key", lambda: "")
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("OMNIPARSE_VISION_MODEL", raising=False)
+    extract._vision_model_cache.clear()
+
+
+@pytest.fixture
 def baseline():
     return Baseline()
+
+
+def _no_ocr(image):
+    """Stand in for a machine with no Tesseract installed."""
+    raise RuntimeError("OCR engine (Tesseract) is not installed in this "
+                       "environment.")
 
 
 def _invoice(**kwargs) -> Invoice:
@@ -230,7 +253,7 @@ FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"
 COURIER = FIXTURES / "courier_reconciliation.xlsx"
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def courier(baseline):
     return process(COURIER.read_bytes(), "courier_reconciliation.xlsx", baseline)
 
@@ -402,3 +425,121 @@ def test_a_ragged_csv_does_not_defeat_the_reader(baseline):
                   baseline)
     assert run.ok, run.error
     assert len(run.results[0].invoice.line_items) == 2
+
+
+# ===========================================================================
+# The last resort, and only the last resort
+#
+# Rules run first, every time. A model is reached when they genuinely came up
+# short — a scan with no OCR engine behind it, a sheet with no header anywhere
+# in it. Two things have to stay true: the model must not take over documents
+# the rules can already read, and with no key configured the record must say
+# plainly that it could not be read rather than quietly inventing one.
+# ===========================================================================
+def test_a_readable_document_never_reaches_the_model(baseline, monkeypatch):
+    """If the rules can read it, nothing is sent anywhere and nothing is paid
+    for."""
+    called = []
+    monkeypatch.setattr(extract, "from_image",
+                        lambda *a, **k: called.append(a) or Invoice())
+
+    run = process((SAMPLES / "invoice_clean.pdf").read_bytes(),
+                  "invoice_clean.pdf", baseline)
+    assert not called
+    assert run.results[0].invoice.extraction_method.startswith("rules")
+
+
+def test_no_ocr_engine_is_a_message_not_a_crash(baseline, monkeypatch):
+    """Her Windows has no Tesseract. The file must still go through the
+    pipeline and come out saying why it is empty."""
+    monkeypatch.setattr(ingest, "_ocr", _no_ocr)
+
+    run = process((SAMPLES / "invoice_scan.png").read_bytes(), "scan.png",
+                  baseline)
+    assert run.ok, run.error
+    invoice = run.results[0].invoice
+    assert "no OCR engine" in invoice.extraction_method
+    assert invoice.confidence == 0
+
+
+def test_an_unreadable_scan_is_flagged_rather_than_guessed(baseline, monkeypatch):
+    """The worst outcome would be a confident record nobody can check."""
+    monkeypatch.setattr(ingest, "_ocr", _no_ocr)
+
+    run = process((SAMPLES / "invoice_scan.png").read_bytes(), "scan.png",
+                  baseline)
+    codes = {a.code for a in run.results[0].anomalies}
+    assert "AUDIT_TRAIL_GAP" in codes
+    assert "LOW_CONFIDENCE" in codes
+    assert run.results[0].verdict == "HOLD"
+
+
+def test_the_trace_says_which_engine_read_the_document(baseline):
+    """"The agent read it" and "a model guessed at it" are not the same
+    claim, and an audit tool has to be able to tell them apart."""
+    run = process((SAMPLES / "invoice_clean.pdf").read_bytes(),
+                  "invoice_clean.pdf", baseline)
+    extraction = next(s for s in run.trace if s.agent == "Structured Extraction")
+    assert "rules" in extraction.detail
+
+
+def test_the_vision_reader_stays_quiet_without_a_key():
+    """No key, no call, no invented record."""
+    invoice = extract.from_image(b"not really a png", "x.png")
+    assert invoice.confidence == 0
+    assert invoice.invoice_id == ""
+    assert "no vision key" in invoice.extraction_method
+
+
+def test_a_sheet_is_rendered_for_a_model_to_read():
+    """The fallback for a sheet with no header: hand the model the lines."""
+    frame, _ = ingest.read_table(
+        (FIXTURES / "F_decoy.csv").read_bytes(), "F_decoy.csv")
+    text = extract.sheet_as_text(frame)
+    assert "Crescent IT Services" in text
+    assert "nan" not in text.lower()
+
+
+# ===========================================================================
+# A model name is not a constant
+#
+# This code first shipped pointing at llama-4-scout, which Groq retired, and
+# every scan came back "vision failed (404)". A dead string in a config file
+# took down a working feature. The account's own model list decides now.
+# ===========================================================================
+def test_the_vision_model_is_chosen_not_hard_coded(monkeypatch):
+    from omniparse import extract as ex
+
+    ex._vision_model_cache.clear()
+    monkeypatch.setattr(ex, "_models_on_this_account",
+                        lambda: {"qwen/qwen3.8-27b", "llama-3.1-8b-instant"})
+    monkeypatch.setattr(ex, "_api_key", lambda: "k")
+    assert ex.vision_model() == "qwen/qwen3.8-27b"
+
+
+def test_a_retired_first_choice_falls_through_to_the_next(monkeypatch):
+    from omniparse import extract as ex
+
+    ex._vision_model_cache.clear()
+    monkeypatch.setattr(ex, "_api_key", lambda: "k")
+    monkeypatch.setattr(ex, "_models_on_this_account",
+                        lambda: {"meta-llama/llama-4-maverick-17b-128e-instruct"})
+    assert ex.vision_model() == "meta-llama/llama-4-maverick-17b-128e-instruct"
+
+
+def test_an_unreachable_model_list_does_not_stop_us_trying(monkeypatch):
+    """Better a 404 we can report than a refusal to even attempt the page."""
+    from omniparse import extract as ex
+
+    ex._vision_model_cache.clear()
+    monkeypatch.setattr(ex, "_api_key", lambda: "k")
+    monkeypatch.setattr(ex, "_models_on_this_account", lambda: set())
+    assert ex.vision_model() == ex.VISION_CANDIDATES[0]
+
+
+def test_an_explicit_override_always_wins(monkeypatch):
+    from omniparse import extract as ex
+
+    ex._vision_model_cache.clear()
+    monkeypatch.setenv("OMNIPARSE_VISION_MODEL", "some/other-model")
+    assert ex.vision_model() == "some/other-model"

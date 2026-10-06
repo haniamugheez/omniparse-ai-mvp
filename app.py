@@ -110,14 +110,30 @@ with st.sidebar:
     ledger = base.invoice_level()
     st.write(f"📚 Baseline ledger — **{len(ledger)}** invoices, "
              f"**{len(base.vendors)}** vendors")
-    st.write("🔤 OCR (Tesseract) — " + ("**ready**" if ocr_ready()
+
+    has_ocr, has_model = ocr_ready(), extract.llm_available()
+    st.write("🔤 OCR (Tesseract) — " + ("**ready**" if has_ocr
                                         else "**not installed**"))
-    st.write("🧠 LLM fallback — " + ("**connected**" if extract.llm_available()
-                                     else "**off (rules only)**"))
-    if not extract.llm_available():
-        st.caption("Rules read every sample document on their own. Add a "
-                   "`GROQ_API_KEY` secret to switch the language-model pass "
-                   "on for messy or unusual layouts.")
+    st.write("🧠 Language model — " + ("**connected**" if has_model
+                                       else "**off (rules only)**"))
+    st.write("👁 Vision (reads a scan) — " + ("**connected**" if has_model
+                                              else "**off**"))
+
+    if has_ocr and has_model:
+        st.caption("Every road is open: rules first, OCR for scans, and a "
+                   "model only for what neither could read.")
+    elif not has_model:
+        st.caption("Rules read PDFs, CSV and Excel on their own — that is "
+                   "most documents, and it costs nothing. Add a "
+                   "`GROQ_API_KEY` secret to let a model read what they "
+                   "cannot."
+                   + ("" if has_ocr else
+                      " Without it **and** without Tesseract, a scanned "
+                      "image cannot be read at all; the record will say so "
+                      "rather than guess."))
+    else:
+        st.caption("No OCR engine here, so scans go to the vision model "
+                   "instead. PDFs, CSV and Excel are read by rules as usual.")
     st.divider()
     st.markdown("**Accepted formats**")
     st.caption("PDF (text or scanned) · PNG, JPG, TIFF · CSV, TSV, XLSX")

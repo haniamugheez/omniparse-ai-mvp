@@ -67,13 +67,19 @@ def read_pdf(data: bytes) -> tuple:
         if len(text.strip()) >= 40:
             return text, "pdf-text-layer"
 
-        # A scan. Render each page and read it the slow way.
+        # A scan. Render each page and read it the slow way — and if there
+        # is no OCR engine here, say so quietly rather than failing the file:
+        # a vision model may still read the page.
         from PIL import Image
 
         pages = []
-        for page in doc:
-            pix = page.get_pixmap(dpi=200)
-            pages.append(_ocr(Image.open(io.BytesIO(pix.tobytes("png")))))
+        try:
+            for page in doc:
+                pix = page.get_pixmap(dpi=200)
+                pages.append(_ocr(Image.open(io.BytesIO(pix.tobytes("png")))))
+        except RuntimeError as exc:
+            logger.info("ingest.pdf_ocr_unavailable %s", exc)
+            return "", "no-ocr"
         return "\n".join(pages), "pdf-ocr"
 
 
@@ -119,7 +125,13 @@ def ingest(data: bytes, filename: str) -> dict:
     """One file in, one payload out.
 
     {"kind": "pdf"|"image"|"table", "text": str|None, "frame": DataFrame|None,
-     "method": str}
+     "image": bytes|None, "method": str}
+
+    A page with no readable text is not an error any more. Tesseract may not
+    be installed, or the scan may simply be too poor for it — and in both
+    cases a vision model can still read the page, so the raw bytes are handed
+    on and the next agent decides. Only a file nobody can open at all fails
+    here.
     """
     kind = route(filename)
     if not kind:
@@ -129,10 +141,34 @@ def ingest(data: bytes, filename: str) -> dict:
 
     if kind == "table":
         frame, method = read_table(data, filename)
-        return {"kind": kind, "text": None, "frame": frame, "method": method}
+        return {"kind": kind, "text": None, "frame": frame, "image": None,
+                "method": method}
 
-    text, method = read_pdf(data) if kind == "pdf" else read_image(data)
-    if not text.strip():
-        raise ValueError(
-            f"{filename}: no readable text was found in this document.")
-    return {"kind": kind, "text": text, "frame": None, "method": method}
+    if kind == "image":
+        try:
+            text, method = read_image(data)
+        except RuntimeError as exc:          # no OCR engine on this machine
+            logger.info("ingest.ocr_unavailable %s", exc)
+            text, method = "", "no-ocr"
+        return {"kind": kind, "text": text, "frame": None, "image": data,
+                "method": method}
+
+    text, method = read_pdf(data)
+    page_image = None
+    if len(text.strip()) < 40:
+        page_image = _first_page_png(data)
+        method = method or "pdf-unreadable"
+    return {"kind": kind, "text": text, "frame": None, "image": page_image,
+            "method": method}
+
+
+def _first_page_png(data: bytes) -> bytes | None:
+    """A picture of page one, for a vision model to read when nothing else can."""
+    try:
+        import pymupdf
+
+        with pymupdf.open(stream=data, filetype="pdf") as doc:
+            return doc[0].get_pixmap(dpi=200).tobytes("png")
+    except Exception:   # noqa: BLE001
+        logger.exception("ingest.render_failed")
+        return None
